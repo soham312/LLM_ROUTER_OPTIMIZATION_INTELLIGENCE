@@ -5,6 +5,8 @@ from router.embeddings import ContextEmbedder
 from router.bandit import LinUCBRouter
 from judge.judge import LLMJudge
 
+from observability.logger import StructuredLogger
+
 logger = logging.getLogger(__name__)
 
 class OptimizationRouter:
@@ -17,6 +19,7 @@ class OptimizationRouter:
     - LinUCB Contextual Bandit routing (Stage 3)
     - Non-stationary shock adaptation via bandit decay (Stage 4)
     - Fallback & escalation logic for low confidence/low quality (Stage 5)
+    - Structured telemetry logging (Stage 8a)
     """
     
     def __init__(self, 
@@ -24,11 +27,13 @@ class OptimizationRouter:
                  embedder: ContextEmbedder, 
                  bandit: LinUCBRouter, 
                  judge: LLMJudge,
-                 fallback_model: str = "mistral"):
+                 fallback_model: str = "mistral",
+                 structured_logger: Optional[StructuredLogger] = None):
         self.client = client
         self.embedder = embedder
         self.bandit = bandit
         self.judge = judge
+        self.structured_logger = structured_logger
         
         # The model to use if the bandit is unconfident or the initial model fails the judge
         self.fallback_model = fallback_model
@@ -99,7 +104,7 @@ class OptimizationRouter:
         self.bandit.update(selected_model, context_vector, final_reward)
         
         # 8. Return comprehensive payload logged separately from bandit internals
-        return {
+        result = {
             "query": query,
             "response": response,
             "model_used": selected_model,
@@ -111,3 +116,9 @@ class OptimizationRouter:
             "bandit_expected_reward": expected_reward,
             "bandit_uncertainty": uncertainty
         }
+        
+        # Stage 8a: Write structured telemetry log
+        if self.structured_logger:
+            self.structured_logger.log_decision(result)
+            
+        return result
