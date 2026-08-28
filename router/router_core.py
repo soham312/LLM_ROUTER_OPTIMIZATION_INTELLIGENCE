@@ -52,56 +52,81 @@ class OptimizationRouter:
         context_vector = self.embedder.get_embedding(history_with_query)
         
         # 2. Select model via Bandit
-        selected_model, expected_reward, uncertainty = self.bandit.select_model(context_vector)
-        
+        selected_model, expected_reward, uncertainty, is_forced_exploration = self.bandit.select_model(context_vector)
+
         escalation_triggered = False
         escalation_reason = None
-        
+
         # 3. Fallback Logic: Low Confidence
-        if expected_reward < self.CONFIDENCE_THRESHOLD and selected_model != self.fallback_model:
-            logger.warning(f"Escalation: Bandit confidence low (Expected Reward: {expected_reward:.2f}). Escalating to {self.fallback_model}.")
-            selected_model = self.fallback_model
-            escalation_triggered = True
-            escalation_reason = "low_confidence"
-            
+        # `is_forced_exploration` picks are exempt: a genuinely untried arm
+        # always starts at expected_reward == 0.0, so without this exemption
+        # no non-fallback arm could ever clear this gate to earn its first
+        # real trial (see LinUCBRouter's warm-start docstring).
+        #
+        # The escalation target is the bandit's own best-currently-known arm,
+        # not a hardcoded fallback name - `fallback_model` is only used as a
+        # tie-break preference for the (common, early-on) case where nothing
+        # yet differentiates the candidates. This is what lets the system
+        # route away from `fallback_model` itself if its own track record
+        # has degraded (see README Section 11's second finding).
+        if expected_reward < self.CONFIDENCE_THRESHOLD and not is_forced_exploration:
+            escalation_target, _ = self.bandit.best_known_model(
+                context_vector, exclude=selected_model, prefer=self.fallback_model
+            )
+            if escalation_target is not None:
+                logger.warning(f"Escalation: Bandit confidence low (Expected Reward: {expected_reward:.2f}). Escalating to {escalation_target}.")
+                selected_model = escalation_target
+                escalation_triggered = True
+                escalation_reason = "low_confidence"
+
         # 4. Generate Response
         logger.info(f"Routing query to: {selected_model}")
         response = self.client.generate(selected_model, query)
-        
+
         # 5. Evaluate Response
         score, judge_metadata = self.judge.evaluate(query, response.response_text, selected_model)
-        
-        # 6. Fallback Logic: Low Judge Score
-        if score < self.JUDGE_SCORE_THRESHOLD and not escalation_triggered and selected_model != self.fallback_model:
-            logger.warning(f"Escalation: Judge score too low ({score:.2f}). Retrying with {self.fallback_model}.")
-            # Retry with fallback
-            fallback_response = self.client.generate(self.fallback_model, query)
-            fallback_score, fallback_metadata = self.judge.evaluate(query, fallback_response.response_text, self.fallback_model)
-            
-            # If fallback did better, use it. Otherwise stick with original to not waste more time.
-            if fallback_score > score:
-                response = fallback_response
-                score = fallback_score
-                judge_metadata = fallback_metadata
-                selected_model = self.fallback_model
-                escalation_triggered = True
-                escalation_reason = "low_judge_score"
-            else:
-                logger.warning(f"Fallback didn't improve score. Sticking with original model {selected_model}.")
-        
-        # 7. Update Bandit
-        # Only update if we didn't escalate due to low confidence (as that means we bypassed the bandit's choice).
-        # Alternatively, we CAN update the bandit with the score of whatever model we eventually used.
-        # It's usually better to update for the model that actually ran, so it learns about the fallback model too.
-        
+
         # We need a composite reward. It should balance quality (score) and cost.
         # A simple reward function: Quality - Penalty for Cost
         # Since scores are [0,1], we can normalize cost to a similar scale or penalize slightly.
         # e.g., reward = score - (cost_per_1M * 0.1)
-        cost_penalty = response.simulated_cost * 0.1 
-        final_reward = max(0.0, score - cost_penalty)
-        
-        self.bandit.update(selected_model, context_vector, final_reward)
+        # Tracks every (model -> reward) actually observed this round, so the
+        # bandit learns from every arm that really ran - not only whichever
+        # one's response is ultimately served. Without this, an arm escalated
+        # away from on a low judge score would never have its own outcome
+        # recorded, and would stay stuck at its prior belief forever.
+        observed_rewards = {selected_model: max(0.0, score - response.simulated_cost * 0.1)}
+
+        # 6. Fallback Logic: Low Judge Score
+        # Same dynamic-target reasoning as step 3: retry with the bandit's
+        # own best-known *other* arm rather than a hardcoded fallback name.
+        if score < self.JUDGE_SCORE_THRESHOLD and not escalation_triggered:
+            retry_target, _ = self.bandit.best_known_model(
+                context_vector, exclude=selected_model, prefer=self.fallback_model
+            )
+            if retry_target is not None:
+                logger.warning(f"Escalation: Judge score too low ({score:.2f}). Retrying with {retry_target}.")
+                retry_response = self.client.generate(retry_target, query)
+                retry_score, retry_metadata = self.judge.evaluate(query, retry_response.response_text, retry_target)
+                observed_rewards[retry_target] = max(0.0, retry_score - retry_response.simulated_cost * 0.1)
+
+                # If the retry did better, use it. Otherwise stick with the
+                # original to not waste more time.
+                if retry_score > score:
+                    response = retry_response
+                    score = retry_score
+                    judge_metadata = retry_metadata
+                    selected_model = retry_target
+                    escalation_triggered = True
+                    escalation_reason = "low_judge_score"
+                else:
+                    logger.warning(f"Retry didn't improve score. Sticking with original model {selected_model}.")
+
+        # 7. Update Bandit - once per distinct model actually executed this
+        # round, each with its own observed reward.
+        final_reward = observed_rewards[selected_model]
+        for model, reward in observed_rewards.items():
+            self.bandit.update(model, context_vector, reward)
         
         # 8. Return comprehensive payload logged separately from bandit internals
         result = {

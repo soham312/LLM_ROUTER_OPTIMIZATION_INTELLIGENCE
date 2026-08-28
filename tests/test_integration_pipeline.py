@@ -17,6 +17,7 @@ low-judge-score escalation path).
 """
 
 import json
+from collections import Counter
 
 import numpy as np
 import pytest
@@ -118,57 +119,95 @@ def test_single_query_flows_through_bandit_judge_and_logger(api_client):
 
 
 # ---------------------------------------------------------------------------
-# 2. Cold-start low-confidence escalation, exercised through the real bandit
+# 2. Cold-start: forced warm-start trial, not a low-confidence escalation
 # ---------------------------------------------------------------------------
 
-def test_cold_start_query_escalates_on_low_confidence(api_client):
+def test_cold_start_first_query_is_a_forced_warm_start_not_a_confidence_escalation(api_client):
     """
-    A brand-new LinUCBRouter ties every arm at zero expected reward, so the
-    router's own CONFIDENCE_THRESHOLD check should deterministically
-    escalate the very first query to the fallback model - no mocking of
-    router_core needed to observe this, it's what the real code does.
+    Bug fix (post-Stage 10a): a brand-new bandit used to deadlock - every
+    arm ties at expected_reward == 0.0, which always fails the confidence
+    gate, which always re-routes to the fallback model, which means a
+    non-fallback arm could NEVER earn its first real trial. LinUCBRouter now
+    forces every arm to be tried once (warm-start) before the confidence
+    gate applies at all, so the very first query should go to the *first*
+    model in the router's arm list - not skip straight to the fallback via
+    "low_confidence".
+
+    llama3.2:1b (first in PRICING_PER_1M_TOKENS order) is deterministically
+    capped by the mock judge below JUDGE_SCORE_THRESHOLD (base 0.4 + at most
+    +0.198 jitter, always < 0.6), so this specific query still ends up
+    escalating - but via the real "low_judge_score" path, not because the
+    bandit was never allowed to try the arm in the first place.
     """
     client, router, log_path = api_client
+    first_arm = router.bandit.models[0]
+    assert first_arm == "llama3.2:1b"
 
     resp = _post(client, "hello")
     body = resp.json()
 
     assert body["escalated"] is True
-    assert body["escalation_reason"] == "low_confidence"
+    assert body["escalation_reason"] == "low_judge_score"
     assert body["model_used"] == router.fallback_model
+
+    # The deadlock fix's whole point: the de-prioritized first arm still
+    # earned a real update from its own trial, not just the fallback.
+    assert router.bandit.pull_counts[first_arm] == 1
+    assert router.bandit.pull_counts[router.fallback_model] == 1
 
     logs = _read_jsonl(log_path)
     assert logs[0]["escalated"] is True
-    assert logs[0]["escalation_reason"] == "low_confidence"
+    assert logs[0]["escalation_reason"] == "low_judge_score"
+
+
+def test_warm_start_covers_every_arm_within_the_first_few_queries(api_client):
+    """
+    Structural verification of the deadlock fix: every arm should have
+    received at least one real trial well before traffic volume would make
+    that plausible by chance alone under the old (broken) behavior, where a
+    non-fallback arm could never be tried at all.
+    """
+    client, router, log_path = api_client
+
+    for i in range(len(router.bandit.models)):
+        _post(client, f"warm start probe query {i}")
+
+    assert all(count >= 1 for count in router.bandit.pull_counts.values())
 
 
 # ---------------------------------------------------------------------------
-# 3. Low-judge-score escalation, exercised through the real judge
+# 3. Low-judge-score escalation via a genuine (non-warm-start) UCB pick
 # ---------------------------------------------------------------------------
 
 def test_confident_but_low_quality_arm_escalates_on_judge_score(api_client):
     """
-    Primes the bandit so a low-quality arm (llama3.2:1b) is confidently
-    selected for one specific query's real (mock-mode) embedding, then
-    confirms the router's real judge-score fallback kicks in: the mock
-    judge deterministically caps llama3.2:1b's score below the 0.6
-    JUDGE_SCORE_THRESHOLD (base 0.4 + at most +0.198 jitter), so the router
-    should retry with mistral and keep the better result.
+    Exhausts warm-start for every arm with throwaway updates, then primes
+    llama3.2:1b so it's confidently selected via genuine UCB comparison
+    (not a forced warm-start trial) for one specific query's real
+    (mock-mode) embedding. Confirms the router's real judge-score fallback
+    still kicks in: the mock judge deterministically caps llama3.2:1b's
+    score below the 0.6 JUDGE_SCORE_THRESHOLD, so the router should retry
+    with mistral and keep the better result.
     """
     client, router, log_path = api_client
     query = "integration test query"
+
+    dummy_context = router.embedder.get_embedding([{"role": "user", "content": "warm-start filler"}])
+    for model in router.bandit.models:
+        router.bandit.update(model, dummy_context, reward=0.01)
 
     # Compute the exact context vector route_and_execute will derive for
     # this query (mock embeddings are deterministic per-process for
     # identical input text), then feed the bandit a few confident,
     # high-reward observations for llama3.2:1b at that vector - enough to
-    # clear CONFIDENCE_THRESHOLD and beat the still-untouched arms' UCB.
+    # win the UCB comparison against the other arms' single throwaway update.
     context_vector = router.embedder.get_embedding([{"role": "user", "content": query}])
     for _ in range(3):
         router.bandit.update("llama3.2:1b", context_vector, reward=1.0)
 
-    selected_model, expected_reward, _ = router.bandit.select_model(context_vector)
+    selected_model, expected_reward, _, is_forced = router.bandit.select_model(context_vector)
     assert selected_model == "llama3.2:1b"
+    assert is_forced is False
     assert expected_reward >= router.CONFIDENCE_THRESHOLD
 
     resp = _post(client, query)
@@ -267,3 +306,60 @@ def test_logged_traffic_feeds_dashboard_data_layer_correctly(api_client):
 
     per_model = data_layer.get_per_model_stats()
     assert sum(stats["query_count"] for stats in per_model.values()) == len(queries)
+
+
+# ---------------------------------------------------------------------------
+# 7. Bug fix: a degraded dominant model no longer traps the system
+# ---------------------------------------------------------------------------
+
+def test_shocked_dominant_model_traffic_migrates_away(api_client):
+    """
+    Bug fix: the low-confidence escalation gate used to always route to a
+    hardcoded fallback_model unconditionally - so if the currently-dominant
+    model (which happens to be the configured fallback) itself degraded,
+    the system had no way to notice and kept escalating right back into the
+    very model that just failed.
+
+    Repeats one query many times so the bandit builds real, convergent
+    evidence for that exact context, shocks whichever model that evidence
+    converged on, and confirms traffic actually migrates elsewhere
+    afterward.
+
+    The judge's mock scoring is replaced with a deterministic version (real
+    `set_shock` state is still consulted, so the shock mechanism itself
+    stays real) purely to remove its `hash(prompt + response)` jitter -
+    that jitter is reseeded by Python's per-process hash randomization, so
+    leaving it in made this specific test's *convergence speed* flaky
+    across separate test runs even though the underlying fix is correct
+    every time; every other test in this file has no such dependency on
+    run-to-run hash stability.
+    """
+    client, router, log_path = api_client
+    query = "what is the capital of france"
+
+    base_scores = {"llama3.2:1b": 0.3, "llama3.2:3b": 0.75, "phi3": 0.75, "mistral": 0.9}
+
+    def deterministic_evaluate(q, response_text, model):
+        score = base_scores.get(model, 0.5)
+        penalty = router.judge._shock_state.get(model, 0.0)
+        return max(0.0, score - penalty), {"reasoning": "deterministic test double"}
+
+    router.judge.evaluate = deterministic_evaluate
+
+    served_before = Counter()
+    for _ in range(40):
+        body = _post(client, query).json()
+        served_before[body["model_used"]] += 1
+
+    dominant_model, dominant_count = served_before.most_common(1)[0]
+    # Sanity check this test actually set up genuine convergence, not noise.
+    assert dominant_count >= 30
+
+    router.judge.set_shock(dominant_model, 0.6)
+
+    served_after = Counter()
+    for _ in range(40):
+        body = _post(client, query).json()
+        served_after[body["model_used"]] += 1
+
+    assert served_after[dominant_model] < dominant_count / 2
