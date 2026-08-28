@@ -21,12 +21,23 @@ def get_router() -> OptimizationRouter:
     constraint: the API is runnable and demoable without a local Ollama
     server. Set ROUTER_MOCK_MODE=false (with Ollama running and models
     pulled) to serve real inference instead.
+
+    Embeddings are controlled by a separate ROUTER_MOCK_EMBEDDINGS flag
+    (defaulting to whatever ROUTER_MOCK_MODE resolves to, so the common
+    case needs no extra configuration) rather than being forced to follow
+    the LLM client - real embeddings need sentence-transformers/torch
+    installed, a meaningfully heavier dependency than real LLM inference
+    alone, so it should be possible to smoke-test real Ollama calls with
+    mocked embeddings without that install being a hard requirement.
     """
     mock_mode = os.environ.get("ROUTER_MOCK_MODE", "true").lower() != "false"
+    embeddings_mock_mode = os.environ.get(
+        "ROUTER_MOCK_EMBEDDINGS", "true" if mock_mode else "false"
+    ).lower() != "false"
     models = list(UnifiedLLMClient.PRICING_PER_1M_TOKENS.keys())
 
     client = UnifiedLLMClient(mock_mode=mock_mode)
-    embedder = ContextEmbedder(mock_mode=mock_mode)
+    embedder = ContextEmbedder(mock_mode=embeddings_mock_mode)
     bandit = LinUCBRouter(models=models, embedding_dim=embedder.embedding_dim)
     judge = LLMJudge(client)
     structured_logger = StructuredLogger()
