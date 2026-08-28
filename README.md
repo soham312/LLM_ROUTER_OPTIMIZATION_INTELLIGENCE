@@ -158,6 +158,17 @@ router can say "how sure am I" per query, not just "which model is best on
 average," which is exactly the signal `OptimizationRouter` needs for its
 escalation logic.
 
+**Forced warm-start.** A brand-new arm has `theta_a = 0`, so `UCB_a(x)`'s
+exploitation term is exactly `0.0` for every context until it's been
+updated at least once - and the router's own confidence gate treats
+`expected_reward == 0.0` as "don't trust this," which would make it
+impossible for any non-fallback arm to ever earn that first update (see
+Section 11 for the bug this caused and how it was fixed). `select_model`
+therefore tries every arm once, unconditionally, in `models` order, before
+letting UCB comparisons decide anything - the same round-robin
+initialization UCB1 itself requires, applied here per-arm rather than
+globally.
+
 ## 5. Non-Stationarity: Decay, Shocks, and Escalation
 
 Production LLM traffic is not IID. Two failure modes matter:
@@ -185,23 +196,30 @@ from it - without any special-cased "shock detection" code path; it falls
 out of the same online-learning machinery used for ordinary drift.
 
 **Escalation** (`router/router_core.py`) is the safety net on top of the
-bandit, with two independent triggers:
+bandit, with two independent triggers. Both target whichever arm the
+bandit's own `best_known_model()` currently rates highest - preferring the
+configured `fallback_model` only as a tie-break, not as a hardcoded
+destination (Section 11's second finding covers the bug this fixes):
 
 - **Low confidence**: `expected_reward < CONFIDENCE_THRESHOLD (0.3)` and the
-  bandit's pick isn't already the fallback model → escalate immediately,
-  before even generating a response. This is what makes a *cold* bandit
-  safe: with zero data every arm ties at an expected reward of `0.0`, which
-  is below threshold, so the very first queries in a fresh deployment go
-  straight to the trusted fallback rather than to an untested model.
+  pick isn't a forced warm-start trial → escalate immediately, before even
+  generating a response. A genuinely untried arm always starts at
+  `expected_reward == 0.0` (below threshold), which is exactly why
+  `LinUCBRouter` forces every arm through one unconditional warm-start trial
+  first (Section 4/11) - otherwise this gate alone would make it impossible
+  for any non-fallback arm to ever earn its first data point.
 - **Low judge score**: after generating and judging a response, if
-  `score < JUDGE_SCORE_THRESHOLD (0.6)` and the chosen model wasn't already
-  the fallback → retry with the fallback and keep whichever response scored
+  `score < JUDGE_SCORE_THRESHOLD (0.6)` and we haven't already escalated →
+  retry with the best-known other arm and keep whichever response scored
   higher. This catches cases where the bandit was *confident* but wrong for
   this particular query.
 
-The bandit is still updated with whatever model actually ran (including an
-escalated fallback), so escalations feed back into learning instead of
-being thrown away.
+Every model that's actually executed in a round gets its own bandit update
+with its own observed reward - not just whichever response is ultimately
+served to the caller. A low-judge-score escalation, for example, generates
+*and judges* both the originally selected model and the fallback, so both
+arms learn from what really happened, even though only one response goes
+back to the user.
 
 ## 6. Reward Function Design
 
@@ -393,60 +411,139 @@ iteration:
 - `LLMJudge`: returns a deterministic score derived from `(model, prompt,
   response)` instead of calling a judge model.
 
-Every test in this repo runs in mock mode (57 tests, sub-3-second full
+Every test in this repo runs in mock mode (69 tests, sub-10-second full
 suite) - real Ollama inference is opt-in (`mock_mode=False`, or
 `ROUTER_MOCK_MODE=false` for the API), for when you actually want to watch
 real models get routed to.
 
+**This has been verified against a real local Ollama server**, not just
+written to work in theory: `client.generate("llama3.2:1b", ...)` returned a
+real answer in ~2s; `LLMJudge.evaluate` (using `mistral` as the judge)
+correctly parsed a real `SCORE: 10` response into `1.0` in ~17s; the full
+`OptimizationRouter` pipeline (real client + judge, mocked embeddings)
+correctly warm-started through `llama3.2:1b` then `llama3.2:3b` with real
+generations, real judge scores, and a correctly-structured JSONL log entry
+for each; and `POST /v1/route` with `ROUTER_MOCK_MODE=false` served a real
+answer end-to-end through the deployed API. Real embeddings specifically
+(`sentence-transformers`/`torch`) weren't exercised in this pass - they're
+a separate, heavier dependency and the router doesn't care what produced
+the context vector it's handed, only its shape - so `ROUTER_MOCK_EMBEDDINGS`
+exists to control that independently of `ROUTER_MOCK_MODE`
+(`api/dependencies.py`): real inference can be verified without also
+requiring the embeddings install.
+
 ## 11. Known Limitations & Future Work
 
 Being upfront about this, because it's a legitimate finding, not something
-swept under the rug:
+swept under the rug.
 
-**Mock-mode traffic tends to collapse onto a single arm.** Running
-`python -m experiments.simulator` produced a 300-query batch where routing
-converged to 100% `mistral` after the first couple of queries, despite a
-configured mid-run distribution shift and a quality shock on
-`llama3.2:1b`. Root cause, traced end-to-end:
+### Fixed: non-fallback arms could never earn their first trial (structural deadlock)
+
+Running `python -m experiments.simulator` originally produced a 300-query
+batch where routing converged to 100% `mistral` after the first couple of
+queries, despite a configured mid-run distribution shift and a quality
+shock on `llama3.2:1b`. Root cause, traced end-to-end:
 
 1. A cold bandit ties every arm at `expected_reward = 0.0`, so the very
-   first query escalates to the fallback model (`mistral`) via the
-   low-confidence path (Section 5) - by design, and correct.
-2. `bandit.update()` only touches the arm that actually ran. Every other
-   arm's `A`/`b` stay at their literal initial values - untouched, not just
-   unfavored.
-3. Because `gamma = 0.99 < 1.0` is applied to `A_mistral` on every update,
-   its inverse `A_inv` is inflated slightly in *all* directions - including
-   ones orthogonal to anything actually observed. That inflated uncertainty
-   term, combined with a rapidly growing exploitation term (`mistral`'s
-   judge score is high in mock mode), pushes `mistral`'s UCB durably above
-   every untouched arm's static `UCB = alpha * 1.0` - so the bandit keeps
-   picking `mistral` on its own, without ever tripping the escalation flag
-   again, and no other arm ever gets a second data point to compete with.
-4. Mock embeddings compound this: they're independent random unit vectors
-   per query text with no real semantic structure, so even if another arm
-   *were* tried once, that one data point wouldn't transfer to help predict
-   reward on a different, unrelated-looking query - real
-   `sentence-transformers` embeddings (topically clustered) would very
-   likely behave differently here.
+   first query escalated to the fallback model (`mistral`) via the
+   low-confidence path (Section 5).
+2. `bandit.update()` was only ever called with the *final* `selected_model`
+   variable - which, after an escalation, had already been reassigned to
+   the fallback. **The originally-picked arm was never updated at all**,
+   whether or not it actually ran. That's a hard deadlock, not a slow
+   convergence: an arm needs `expected_reward >= 0.3` to avoid being
+   escalated away from, but it can only ever earn a non-zero
+   `expected_reward` via an update it can now never receive. No arm but the
+   (gate-exempt) fallback could structurally ever be tried, for any number
+   of queries, regardless of decay, embeddings, or randomness.
 
-**How this could be fixed** (not yet implemented, deliberately left as the
-next iteration rather than patched live mid-demo):
+**Fix** (`router/bandit.py`, `router/router_core.py`):
 
-- **Forced warm-start exploration** - round-robin the first `k` queries
-  per arm before letting UCB drive selection, so every arm gets at least
-  one real data point before the loop above can take hold.
-- **Thompson Sampling** instead of LinUCB - its stochastic draws don't
-  have the same deterministic "whoever wins UCB first, wins forever"
-  failure mode.
-- **Global decay** - decay every arm's `A`/`b` every timestep, not only the
-  arm that was updated, so uncertainty doesn't inflate asymmetrically for
-  arms that happen to get picked early.
-- **A true epsilon-floor** - guarantee a small constant probability of
-  exploring a random arm regardless of UCB, independent of confidence.
-- **Real embeddings** - swap in actual `sentence-transformers` output
-  (`mock_mode=False`) so semantically similar queries genuinely share
-  structure, which is the assumption the linear reward model depends on.
+- `LinUCBRouter.select_model` now forces every arm through one
+  unconditional warm-start trial, in `models` order, before UCB
+  comparisons apply at all - the same initialization UCB1 itself requires.
+  It reports this via a new `is_forced_exploration` flag.
+- `OptimizationRouter`'s low-confidence gate is exempted for a
+  forced-exploration pick, so a genuinely untried arm gets to actually run
+  instead of being escalated away from on sight.
+- Every model that's actually executed in a round - not just whichever
+  response is ultimately served - now gets its own `bandit.update()` call
+  with its own observed reward. A low-judge-score escalation, for example,
+  now updates *both* the originally-picked arm and the fallback, since both
+  really ran and were really judged.
+
+**Verified:** re-running the 300-query simulation after the fix shows every
+arm receiving real trials (`{'mistral': 295, 'llama3.2:3b': 2, 'phi3': 3}`,
+vs. `{'mistral': 300}` before) - and, importantly, this is now a *genuine*
+converged preference for `mistral` (the mock judge scores it highest for
+every query, deterministically, so that's the objectively correct arm to
+converge on here) rather than a structural bypass of the alternatives.
+Tests: `tests/test_bandit.py` (`test_linucb_warm_start_tries_every_arm_once_before_ucb`,
+`test_linucb_low_confidence_arm_can_still_be_updated_after_warm_start`),
+`tests/test_router_core.py` (`test_low_judge_score_escalation_still_updates_the_original_arm`),
+and `tests/test_integration_pipeline.py` (warm-start-through-the-real-API
+tests) all exercise this directly.
+
+### Fixed: a shocked *fallback* model no longer traps the system
+
+Fixing the deadlock above surfaced a second, more targeted finding. The
+whole point of `judge.set_shock()` is to prove the system adapts when a
+model degrades - so the real test isn't shocking an already-inferior model
+(`llama3.2:1b`, which was never winning anyway), it's shocking the
+*currently dominant* model and checking whether traffic actually migrates
+away. It didn't:
+
+```python
+# 75 queries in, mistral is dominant with real accumulated evidence.
+judge.set_shock("mistral", 0.6)  # mistral's judge score craters
+# next 75 queries: still 100% mistral.
+```
+
+Root cause: once warm-start was exhausted, a **low-confidence** escalation
+(`expected_reward < CONFIDENCE_THRESHOLD`) always routed to
+`self.fallback_model` unconditionally - it never asked "is the fallback
+itself trustworthy right now." The fallback being exempt from the
+confidence check (necessary so *some* model always answers) also made it
+exempt from ever being judged unconfident about - a circular trust
+assumption. Combined with mock embeddings having no real semantic
+structure (point 4 above), most arms' `expected_reward` sits near zero for
+any brand-new query regardless of recent track record, so "not confident"
+always meant "use the fallback" - exactly the model that had just degraded.
+
+**Fix** (`router/bandit.py`, `router/router_core.py`):
+
+- Added `LinUCBRouter.best_known_model(context, exclude, prefer)`: returns
+  whichever arm currently has the highest *pure exploitation* estimate
+  (`x · theta`, no exploration bonus - escalation wants "what do we
+  currently believe," not "what should we try next"), optionally excluding
+  the arm that just triggered the escalation.
+- Both escalation paths (low-confidence and low-judge-score) now target
+  `best_known_model(..., prefer=self.fallback_model)` instead of
+  `self.fallback_model` directly. `prefer` is only a *tie-break* - it wins
+  when candidates are genuinely tied (common right after warm-start, when
+  most arms have zero or one data point), but real evidence always
+  overrides it once arms actually differ. This is what lets the system
+  route away from the configured fallback if its own track record has
+  actually gotten worse, while keeping predictable, sensible behavior
+  during the early bootstrap phase when there's no real evidence to go on
+  yet.
+
+**Verified:** repeating one query so the bandit builds real convergent
+evidence, then shocking whichever model that evidence converged on:
+
+```
+before shock: {'mistral': 38, 'llama3.2:3b': 1, 'phi3': 1}
+judge.set_shock('mistral', 0.6)
+after shock:  {'llama3.2:3b': 21, 'phi3': 5, 'mistral': 14}
+```
+
+Traffic to the shocked model drops sharply and the system converges onto a
+different arm - the exact behavior the shock mechanism is supposed to
+demonstrate. Test: `tests/test_integration_pipeline.py::test_shocked_dominant_model_traffic_migrates_away`
+(judge scoring made deterministic there purely to remove
+process-to-process hash jitter, not to change the mechanism being tested);
+also `tests/test_bandit.py` (`test_best_known_model_*`) and
+`tests/test_router_core.py::test_low_confidence_escalation_avoids_a_degraded_fallback`.
 
 This is exactly the kind of "what would you do differently" answer worth
 having ready - see Section 12.
@@ -473,11 +570,15 @@ more data than this system generates. See Section 4.
 world changes?**
 Two mechanisms: exponential decay (`gamma=0.99`) on the arm actually being
 updated fades old evidence, and the confidence-based escalation path
-re-routes to the fallback whenever the bandit's own uncertainty says it
-isn't sure - so a sudden shock shows up as low judge scores, which lowers
-that arm's expected reward, which (given enough decayed updates) eventually
-loses the UCB comparison. See Section 5 - and Section 11 for where this
-mechanism currently breaks down in mock mode.
+re-routes to whichever arm currently looks best whenever the bandit's own
+uncertainty says it isn't sure - so a sudden shock shows up as low judge
+scores, which lowers that arm's expected reward, which (given enough
+decayed updates) eventually loses both the UCB comparison for normal
+routing *and* the `best_known_model` comparison used for escalation
+targets. That second part - the escalation target itself being dynamic
+rather than a hardcoded fallback name - is what lets this work even when
+the model that degrades is the configured fallback; see Section 11's
+second finding for the bug this used to be.
 
 **Q: What is the reward function, and why is it built that way?**
 `max(0, judge_score - 0.1 * simulated_cost)` - quality-dominant with cost as
@@ -501,13 +602,17 @@ actions were actually observed. It's unbiased if *either* the reward model
 DM or IPS alone. See Section 7.
 
 **Q: Walk me through what happens end-to-end for one query.**
-Query → embed to a 384-dim vector → LinUCB picks the highest-UCB arm →
-if expected reward is below 0.3 and it isn't already the fallback, escalate
-immediately → generate a response → judge scores it 0-1 → if the score is
-below 0.6 and the model wasn't already the fallback, retry with the
-fallback and keep whichever scores higher → the bandit is updated with
-whatever model actually ran → the whole decision is written as one JSONL
-line. See the Section 2 diagram.
+Query → embed to a 384-dim vector → LinUCB picks the highest-UCB arm (or a
+forced warm-start trial if any arm hasn't been tried yet) → if expected
+reward is below 0.3 and it isn't a warm-start pick, escalate to whichever
+*other* arm currently looks best (`best_known_model`, preferring the
+configured fallback only as a tie-break) → generate a response → judge
+scores it 0-1 → if the score is below 0.6 and we haven't already escalated,
+retry with whichever other arm currently looks best and keep whichever
+response scores higher → every model that actually ran this round gets its
+own bandit update with its own observed reward → the whole decision
+(whichever response was served) is written as one JSONL line. See the
+Section 2 diagram.
 
 **Q: How would you scale the rate limiter / API for real traffic?**
 The current limiter is a per-process in-memory sliding window - correct
@@ -518,12 +623,24 @@ the same count per key. Documented as the known next step in
 `api/rate_limiter.py`.
 
 **Q: What's a limitation you found, and how would you fix it?**
-Have this one ready cold - it's Section 11 verbatim: mock-mode traffic
-collapses onto a single arm because of an interaction between cold-start
-escalation, per-update-only decay inflating uncertainty asymmetrically, and
-unstructured mock embeddings. Fixes: forced warm-start exploration,
-Thompson Sampling, decaying all arms every timestep instead of only the
-updated one, an epsilon-floor, or real embeddings.
+Have this one ready cold - it's Section 11, and it's actually two, found in
+sequence. First: a structural deadlock - `bandit.update()` was called with
+the *final* selected model, which after an escalation was always the
+fallback, so a non-fallback arm could never earn the update needed to clear
+the confidence gate that was blocking it in the first place. Fixed with a
+forced warm-start (try every arm once, unconditionally, before trusting
+UCB) and by updating every arm that actually ran each round, not just
+whichever response was served. Fixing that surfaced a second, subtler one:
+escalation always targeted a hardcoded fallback name unconditionally, so if
+*that specific model* degraded, the system had no way to notice and kept
+routing right back into it. Fixed by making the escalation target dynamic -
+`best_known_model()` returns whichever arm currently has the best real
+evidence, using the configured fallback only as a tie-break for the early
+bootstrap phase where nothing yet differentiates the candidates. Good
+example of a fix revealing the next layer of the same class of bug, and of
+verifying a fix with the actual adversarial case (shock the *dominant*
+model, not an already-losing one) rather than just checking it doesn't
+crash.
 
 **Q: Why zero-cost / local models instead of just calling a real API with a
 small budget?**
@@ -616,19 +733,29 @@ curl -X POST http://127.0.0.1:8000/v1/route \
 for m in llama3.2:1b llama3.2:3b phi3 mistral; do ollama pull "$m"; done
 ```
 
-then set `mock_mode=False` when constructing
-`UnifiedLLMClient`/`ContextEmbedder` (or `ROUTER_MOCK_MODE=false` for the
-API).
+then set `mock_mode=False` when constructing `UnifiedLLMClient` directly,
+or for the API:
+
+```bash
+export ROUTER_MOCK_MODE=false          # real LLM calls via Ollama
+export ROUTER_MOCK_EMBEDDINGS=true     # keep embeddings mocked (default follows ROUTER_MOCK_MODE)
+```
+
+Real embeddings additionally need `pip install sentence-transformers`
+(pulls in `torch`); leave `ROUTER_MOCK_EMBEDDINGS=true` to skip that and
+still get real model inference.
 
 ## 15. Test Coverage
 
-57 tests, full suite runs in about 2 seconds (mock mode, no external
+69 tests, full suite runs in a few seconds (mock mode, no external
 services):
 
 ```
 tests/test_alerts.py                 - AlertManager threshold/hook behavior
 tests/test_api.py                    - Auth, rate limiting, API contract
-tests/test_bandit.py                 - LinUCB init, update, decay/adaptation
+tests/test_api_dependencies.py       - Mock-mode resolution (client vs. embeddings)
+tests/test_bandit.py                 - LinUCB init, update, decay/adaptation,
+                                        warm-start, best_known_model
 tests/test_chart_utils.py            - Dashboard rolling-window/baseline math
 tests/test_client.py                 - Mock generation, cost calculation
 tests/test_dashboard_app.py          - Streamlit smoke tests (AppTest)

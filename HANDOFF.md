@@ -49,15 +49,38 @@
 - **Sliding-window rate limiting, in-memory, auth-before-limit:** A fixed window lets a client burst 2x at the boundary; sliding closes that. In-memory is a deliberate single-process scope decision (documented as the first thing to swap for Redis in a multi-worker deployment). Rate-limiting by the *authenticated* key (checked first) means unauthenticated spam can't drain a real client's quota.
 - **Integration tests use real components, unit tests mock them:** `tests/test_api.py` mocks embedding generation for a fast, isolated API-contract check; `tests/test_integration_pipeline.py` deliberately leaves the embedder/bandit/judge real so it's actually testing the emergent behavior of the wired-together system, not a scripted mock response.
 
-## KNOWN LIMITATION (documented, not yet fixed)
-Running the simulator in mock mode causes routing to collapse onto a single arm (`mistral`) after the first couple of queries, even with a configured distribution shift and shock. Root cause (fully traced, written up in `README.md` Section 11): a cold bandit's first query always escalates to the fallback via the low-confidence path (correct behavior); but `bandit.update()` only touches the arm that actually ran, and per-update decay (`gamma=0.99`) inflates that arm's uncertainty estimate in *all* directions (not just the observed one), which keeps pushing its UCB above every untouched arm's static baseline - so the bandit keeps picking it without ever tripping escalation again, and no other arm gets a second data point. Mock embeddings (independent random vectors per query, no real semantic structure) compound this. Candidate fixes, not yet implemented: forced round-robin warm-start exploration, Thompson Sampling instead of LinUCB, decaying every arm every timestep (not only the updated one), an epsilon-exploration floor, or switching to real `sentence-transformers` embeddings. User has said to revisit this later.
+## BANDIT-COLLAPSE BUG: FIXED, PLUS A NEW FINDING
+The original limitation (routing collapsing to 100% `mistral`, documented here previously) turned out to have a more fundamental cause than first written up: `router/router_core.py` only ever called `bandit.update()` with the *final* `selected_model` variable, which after any escalation had already been reassigned to the fallback. That meant a non-fallback arm could **never** earn the update needed to clear the confidence gate that was blocking it in the first place - a structural deadlock, not a slow convergence, independent of decay/embedding effects.
+
+**Fixed** (`router/bandit.py`, `router/router_core.py`):
+- `LinUCBRouter.select_model` now forces every arm through one unconditional warm-start trial (round-robin, in `models` order) before UCB comparisons apply, reported via a new `is_forced_exploration` flag (return signature is now a 4-tuple).
+- The router's low-confidence gate is exempted for forced-exploration picks.
+- Every model actually executed in a round (not just whichever response is served) now gets its own `bandit.update()` call with its own observed reward - closes the same blind spot for the low-judge-score escalation path.
+
+**Verified:** re-ran the 300-query simulation - `{'mistral': 295, 'llama3.2:3b': 2, 'phi3': 3}` vs. `{'mistral': 300}` before. Every arm now gets real trials; convergence toward `mistral` is a genuine (and here, objectively correct, since the mock judge scores it highest deterministically) learned preference, not a bypass. New/updated tests in `test_bandit.py`, `test_router_core.py`, `test_integration_pipeline.py`. `README.md` Sections 4/5/11/12 updated to match.
+
+**Second finding: also fixed.** Shocking the *fallback* model itself (as opposed to a non-fallback arm) did not cause migration away from it - verified interactively (75 queries in, `judge.set_shock("mistral", 0.6)`, next 75 queries still 100% `mistral`). Root cause: the low-confidence gate always routed to `self.fallback_model` unconditionally, with no check on whether the fallback itself was currently trustworthy - a circular trust assumption.
+
+**Fix** (`router/bandit.py`, `router/router_core.py`): added `LinUCBRouter.best_known_model(context, exclude, prefer)` - returns the arm with the highest pure-exploitation estimate (no exploration bonus), excluding the arm that just triggered escalation. Both escalation paths (low-confidence and low-judge-score) now target this instead of a hardcoded model name; `fallback_model` is now only a *tie-break preference* used when candidates are genuinely tied (common right after warm-start), never an unconditional override once real evidence differs.
+
+**Verified:** repeated a single query so the bandit builds real convergent evidence (`{'mistral': 38, 'llama3.2:3b': 1, 'phi3': 1}`), shocked the dominant model, and traffic migrated (`{'llama3.2:3b': 21, 'phi3': 5, 'mistral': 14}` over the next 40 queries) - the system now demonstrates the exact adaptive behavior `judge.set_shock()` exists to prove. New tests: `test_bandit.py` (`test_best_known_model_*`), `test_router_core.py::test_low_confidence_escalation_avoids_a_degraded_fallback`, `test_integration_pipeline.py::test_shocked_dominant_model_traffic_migrates_away` (this last one needed deterministic judge scoring to avoid flakiness from Python's per-process string-hash randomization affecting the mock judge's jitter term - the underlying fix itself was never flaky, only that one test's convergence-speed assertion was, before the judge mock was made deterministic). `README.md` Sections 5/11/12 updated to match.
+
+## REAL-OLLAMA SMOKE TEST: DONE
+Verified real (non-mock) inference against a locally running Ollama server (all four models already pulled: `llama3.2:1b`, `llama3.2:3b`, `phi3`, `mistral`). Real embeddings (`sentence-transformers`/`torch`) were deliberately left mocked per user's choice - a separate, heavier dependency the router doesn't otherwise need installed to exercise real LLM calls.
+
+- `UnifiedLLMClient(mock_mode=False).generate(...)` - real answer in ~2s, correct token counts/cost.
+- `LLMJudge.evaluate(...)` (using `mistral` as judge) - correctly parsed a real `SCORE: 10` response into `1.0` in ~17s.
+- Full `OptimizationRouter` pipeline (real client+judge, mocked embedder) - warm-started through `llama3.2:1b` then `llama3.2:3b` with real generations and real judge scores; correct JSONL log entries.
+- `POST /v1/route` with `ROUTER_MOCK_MODE=false` - served a real answer end-to-end through the deployed API; auth (401) and validation (422) still correctly enforced.
+
+**Bug found and fixed along the way:** `api/dependencies.py`'s `get_router()` tied a single `ROUTER_MOCK_MODE` env var to *both* the LLM client and the embedder - so there was no way to run real Ollama inference via the API without also requiring `sentence-transformers` installed (it raised `ImportError` otherwise, confirmed via a live 500 error). Fixed by adding an independent `ROUTER_MOCK_EMBEDDINGS` env var (defaults to following `ROUTER_MOCK_MODE`, so the common case is unaffected). New tests in `tests/test_api_dependencies.py`. `README.md` Sections 10/14/15 updated to match.
 
 ## CURRENT STATUS
-- **All phases (1 through 4), the deployment layer, and documentation are complete.**
-- 57 tests passing across the project (`pytest tests/`, ~2-3 seconds, all mock mode, no external services required).
+- **All phases (1 through 4), the deployment layer, and documentation are complete. Both bandit-collapse findings are fixed and verified. Real-Ollama inference is now verified end-to-end (client, judge, full router pipeline, and the API).**
+- 69 tests passing across the project (`pytest tests/`, a few seconds, all mock mode, no external services required), confirmed stable across repeated independent runs.
 - `requirements.txt` now includes `streamlit`, `pandas` (dashboard) and `fastapi`, `uvicorn`, `httpx` (API), in addition to the original `ollama`, `sentence-transformers`, `numpy`, `pytest`.
 - `.gitignore` now excludes `*.jsonl` (generated telemetry logs shouldn't be committed).
-- The one open item is the known bandit-collapse limitation above - explicitly deferred by the user ("tell me this issue later"), not currently scheduled.
+- No open bandit-correctness or verification findings remain. Real embeddings (`sentence-transformers`/`torch`) still haven't been installed/exercised in this environment - the resolution logic for it is tested (`test_api_dependencies.py`), but not a live run - a candidate next item if full end-to-end realism (including embeddings) is ever wanted.
 
 ## CONVENTIONS TO KEEP CONSISTENT
 - Folder/file naming as established above.
