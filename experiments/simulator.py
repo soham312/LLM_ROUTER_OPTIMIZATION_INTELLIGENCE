@@ -104,5 +104,58 @@ class TrafficSimulator:
             result["topic_distribution"] = initial_dist if i < shift_at else new_dist
             
             results_log.append(result)
-            
+
         return results_log
+
+
+if __name__ == "__main__":
+    # Runnable entry point: `python -m experiments.simulator`.
+    #
+    # Without this, the module only defines TrafficSimulator - importing it
+    # (as `python -m experiments.simulator` does) executes no logic and
+    # writes no telemetry, since nothing in this file ever constructs a
+    # router or attaches a StructuredLogger. This wires up a full mock-mode
+    # stack (zero-cost, no Ollama server required) so the dashboard's
+    # observability/router_logs.jsonl has realistic traffic to visualize,
+    # including a mid-run distribution shift and a model quality shock.
+    import logging
+
+    from judge.judge import LLMJudge
+    from observability.logger import StructuredLogger
+    from router.bandit import LinUCBRouter
+    from router.client import UnifiedLLMClient
+    from router.embeddings import ContextEmbedder
+    from router.router_core import OptimizationRouter
+
+    logging.basicConfig(level=logging.INFO)
+
+    models = list(UnifiedLLMClient.PRICING_PER_1M_TOKENS.keys())
+
+    client = UnifiedLLMClient(mock_mode=True)
+    embedder = ContextEmbedder(mock_mode=True)
+    bandit = LinUCBRouter(models=models, embedding_dim=embedder.embedding_dim)
+    judge = LLMJudge(client)
+    structured_logger = StructuredLogger()  # defaults to observability/router_logs.jsonl
+
+    router = OptimizationRouter(
+        client=client,
+        embedder=embedder,
+        bandit=bandit,
+        judge=judge,
+        fallback_model="mistral",
+        structured_logger=structured_logger,
+    )
+
+    simulator = TrafficSimulator(router=router, judge=judge)
+
+    simulator.run_simulation(
+        n_queries=300,
+        initial_dist={"chat": 0.8, "math": 0.1, "code": 0.1},
+        shift_at=150,
+        new_dist={"chat": 0.1, "math": 0.1, "code": 0.8},
+        shock_model_at=220,
+        shock_model="llama3.2:1b",
+        shock_penalty=0.5,
+    )
+
+    print(f"Simulation complete. Telemetry written to {structured_logger.log_filepath}")

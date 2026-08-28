@@ -14,4 +14,5 @@ env/
 
 # Project specific
 *.log
+*.jsonl
 .DS_Store
