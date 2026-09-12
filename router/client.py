@@ -13,6 +13,17 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+
+class OllamaUnavailableError(RuntimeError):
+    """
+    Raised when a real (non-mock) generate() call can't reach the Ollama
+    server or the requested model isn't pulled. Callers must handle this
+    explicitly - the client never silently falls back to mock data on a
+    backend failure, since that would corrupt latency/cost telemetry the
+    bandit and SLA tracker rely on being real.
+    """
+
+
 @dataclass
 class LLMResponse:
     id: str
@@ -138,6 +149,22 @@ class UnifiedLLMClient:
                 simulated_cost=cost,
                 is_mock=False
             )
-        except Exception as e:
-            logger.error(f"Error calling Ollama model {model}: {e}")
-            raise
+        except ConnectionError as e:
+            # ollama-python raises the builtin ConnectionError when the
+            # local server isn't reachable at all (connection refused).
+            logger.error(f"Ollama server unreachable for model {model}: {e}")
+            raise OllamaUnavailableError(
+                f"Could not reach the Ollama server while generating with "
+                f"'{model}'. Is it running? Start it with `ollama serve` "
+                f"(or `brew services start ollama`)."
+            ) from e
+        except ollama.ResponseError as e:
+            # Raised for server-side failures, e.g. the model isn't pulled
+            # (404) - distinguished from "server is down" so the operator
+            # knows to `ollama pull` rather than start the server.
+            logger.error(f"Ollama rejected request for model {model}: {e}")
+            raise OllamaUnavailableError(
+                f"Ollama rejected the request for model '{model}' "
+                f"(status {e.status_code}: {e.error}). Is it pulled? Run "
+                f"`ollama pull {model}`."
+            ) from e

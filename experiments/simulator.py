@@ -118,7 +118,15 @@ if __name__ == "__main__":
     # stack (zero-cost, no Ollama server required) so the dashboard's
     # observability/router_logs.jsonl has realistic traffic to visualize,
     # including a mid-run distribution shift and a model quality shock.
+    #
+    # Same env vars as api/dependencies.py's get_router(), so a real-Ollama
+    # run against this simulator matches the API's real-inference path:
+    #   ROUTER_MOCK_MODE=false          - real Ollama calls via UnifiedLLMClient
+    #   ROUTER_MOCK_EMBEDDINGS=<bool>   - defaults to following ROUTER_MOCK_MODE
+    #   ROUTER_SIM_MODELS=a,b,c         - restrict the arm pool (e.g. to skip
+    #                                     a model that doesn't fit local RAM)
     import logging
+    import os
 
     from judge.judge import LLMJudge
     from observability.logger import StructuredLogger
@@ -129,10 +137,19 @@ if __name__ == "__main__":
 
     logging.basicConfig(level=logging.INFO)
 
-    models = list(UnifiedLLMClient.PRICING_PER_1M_TOKENS.keys())
+    mock_mode = os.environ.get("ROUTER_MOCK_MODE", "true").lower() != "false"
+    embeddings_mock_mode = os.environ.get(
+        "ROUTER_MOCK_EMBEDDINGS", "true" if mock_mode else "false"
+    ).lower() != "false"
 
-    client = UnifiedLLMClient(mock_mode=True)
-    embedder = ContextEmbedder(mock_mode=True)
+    sim_models_env = os.environ.get("ROUTER_SIM_MODELS")
+    if sim_models_env:
+        models = [m.strip() for m in sim_models_env.split(",") if m.strip()]
+    else:
+        models = list(UnifiedLLMClient.PRICING_PER_1M_TOKENS.keys())
+
+    client = UnifiedLLMClient(mock_mode=mock_mode)
+    embedder = ContextEmbedder(mock_mode=embeddings_mock_mode)
     bandit = LinUCBRouter(models=models, embedding_dim=embedder.embedding_dim)
     judge = LLMJudge(client)
     structured_logger = StructuredLogger()  # defaults to observability/router_logs.jsonl
@@ -142,7 +159,7 @@ if __name__ == "__main__":
         embedder=embedder,
         bandit=bandit,
         judge=judge,
-        fallback_model="mistral",
+        fallback_model=models[-1],
         structured_logger=structured_logger,
     )
 
