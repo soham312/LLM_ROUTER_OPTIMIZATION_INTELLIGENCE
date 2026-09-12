@@ -1,7 +1,7 @@
 import time
 import random
 import logging
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Tuple
 from dataclasses import dataclass
 import uuid
 
@@ -24,6 +24,72 @@ class OllamaUnavailableError(RuntimeError):
     """
 
 
+# --- Fault injection --------------------------------------------------
+#
+# These simulate realistic backend failure modes (not a generic
+# Exception) so fault-injection experiments exercise the same exception
+# shapes a real deployment would throw. Each subclasses the builtin
+# exception a real client would actually raise for that failure, so
+# calling code that already does `except ConnectionError` or
+# `except TimeoutError` behaves the same against a simulated fault as
+# against a real one.
+
+class SimulatedConnectionRefusedError(ConnectionError):
+    """The backend process/port is unreachable - server down, wrong port,
+    container crashed. Analogous to errno ECONNREFUSED."""
+
+
+class SimulatedTimeoutError(TimeoutError):
+    """The backend is reachable but did not respond in time - overloaded,
+    hung request, or a network partition dropping packets silently."""
+
+
+class SimulatedServerError(RuntimeError):
+    """The backend responded, but with a server-side error (5xx) - e.g. it
+    crashed handling this specific request, or a reverse proxy in front of
+    it returned bad gateway / service unavailable / gateway timeout."""
+
+    def __init__(self, model: str, status_code: int):
+        self.model = model
+        self.status_code = status_code
+        super().__init__(
+            f"Backend '{model}' returned HTTP {status_code} (simulated fault injection)"
+        )
+
+
+_VALID_FAULT_ERROR_TYPES = ("connection_refused", "timeout", "server_error")
+
+
+@dataclass
+class FaultConfig:
+    """Configuration for a single faulted backend.
+
+    :param probability: Per-request probability in [0, 1] that a call to
+        this backend fails. Ignored (treated as 1.0) when hard_down=True.
+    :param hard_down: If True, every call to this backend fails for as
+        long as the fault is armed - simulates the backend being
+        completely down for the run, rather than merely flaky.
+    :param error_types: Which failure shapes to draw from when the fault
+        triggers. Defaults to all three so repeated triggers look like a
+        real mixed-failure backend rather than one canned error.
+    """
+
+    probability: float = 1.0
+    hard_down: bool = False
+    error_types: Tuple[str, ...] = _VALID_FAULT_ERROR_TYPES
+
+    def __post_init__(self):
+        if not 0.0 <= self.probability <= 1.0:
+            raise ValueError(f"probability must be in [0.0, 1.0], got {self.probability}")
+        if not self.error_types:
+            raise ValueError("error_types must be non-empty")
+        unknown = set(self.error_types) - set(_VALID_FAULT_ERROR_TYPES)
+        if unknown:
+            raise ValueError(
+                f"Unknown error_types {sorted(unknown)}; must be a subset of {_VALID_FAULT_ERROR_TYPES}"
+            )
+
+
 @dataclass
 class LLMResponse:
     id: str
@@ -35,6 +101,42 @@ class LLMResponse:
     latency_ms: float
     simulated_cost: float
     is_mock: bool
+
+def classify_backend_error(exc: Exception) -> str:
+    """
+    Full, human-readable reason a backend call failed: which known
+    failure mode it was, plus the original message. Anything not
+    recognized is still reported - tagged 'unclassified_error' with its
+    real exception class name attached - never folded into a generic
+    bucket. Shared by router_core's failover handling and by
+    experiments/fault_injection.py's reporting, so both describe the
+    same failure the same way.
+    """
+    if isinstance(exc, SimulatedConnectionRefusedError):
+        return f"connection_refused: {exc}"
+    if isinstance(exc, SimulatedTimeoutError):
+        return f"timeout: {exc}"
+    if isinstance(exc, SimulatedServerError):
+        return f"http_{exc.status_code}: {exc}"
+    if isinstance(exc, OllamaUnavailableError):
+        return f"ollama_unavailable: {exc}"
+    return f"unclassified_error[{type(exc).__name__}]: {exc}"
+
+
+def backend_error_code(exc: Exception) -> str:
+    """Stable, low-cardinality bucket key for aggregate breakdowns - the
+    full detail (exact message, random timeout duration, HTTP status,
+    etc.) lives in classify_backend_error(), not here."""
+    if isinstance(exc, SimulatedConnectionRefusedError):
+        return "connection_refused"
+    if isinstance(exc, SimulatedTimeoutError):
+        return "timeout"
+    if isinstance(exc, SimulatedServerError):
+        return f"http_{exc.status_code}"
+    if isinstance(exc, OllamaUnavailableError):
+        return "ollama_unavailable"
+    return f"unclassified_error[{type(exc).__name__}]"
+
 
 class UnifiedLLMClient:
     """
@@ -63,7 +165,80 @@ class UnifiedLLMClient:
         if not self.mock_mode and ollama is None:
             logger.warning("Ollama not installed. Forcing mock mode. Install with: pip install ollama")
             self.mock_mode = True
-            
+
+        # model -> FaultConfig, for fault-injection experiments.
+        self._faults: Dict[str, FaultConfig] = {}
+
+    def inject_fault(
+        self,
+        model: str,
+        probability: float = 1.0,
+        hard_down: bool = False,
+        error_types: Optional[Tuple[str, ...]] = None,
+    ) -> None:
+        """
+        Arms a fault on `model`: subsequent generate() calls to it will
+        raise a simulated backend error instead of producing a response,
+        either probabilistically (`probability`) or unconditionally for
+        the rest of the run (`hard_down=True`).
+        """
+        config = FaultConfig(
+            probability=probability,
+            hard_down=hard_down,
+            error_types=tuple(error_types) if error_types else _VALID_FAULT_ERROR_TYPES,
+        )
+        self._faults[model] = config
+        logger.warning(
+            f"Fault injection ARMED for '{model}': hard_down={config.hard_down}, "
+            f"probability={config.probability}, error_types={config.error_types}"
+        )
+
+    def clear_fault(self, model: Optional[str] = None) -> None:
+        """Disarms the fault on `model`, or every armed fault if model is None."""
+        if model is None:
+            self._faults.clear()
+            logger.info("Fault injection cleared for all backends.")
+        else:
+            self._faults.pop(model, None)
+            logger.info(f"Fault injection cleared for '{model}'.")
+
+    def is_faulted(self, model: str) -> bool:
+        return model in self._faults
+
+    def _maybe_raise_fault(self, model: str) -> None:
+        """Raises a simulated backend error if `model` has an armed fault
+        that triggers this call. Never swallows anything - either returns
+        silently (no fault configured, or this call got a lucky roll under
+        a probabilistic fault) or raises a specific, logged exception."""
+        config = self._faults.get(model)
+        if config is None:
+            return
+
+        triggered = config.hard_down or (random.random() < config.probability)
+        if not triggered:
+            return
+
+        error_type = random.choice(config.error_types)
+        if error_type == "connection_refused":
+            exc: Exception = SimulatedConnectionRefusedError(
+                f"[Errno 61] Connection refused: backend '{model}' is unreachable (fault injection)"
+            )
+        elif error_type == "timeout":
+            timeout_ms = random.randint(2000, 10000)
+            exc = SimulatedTimeoutError(
+                f"Request to backend '{model}' timed out after {timeout_ms}ms (fault injection)"
+            )
+        elif error_type == "server_error":
+            status_code = random.choice([500, 502, 503, 504])
+            exc = SimulatedServerError(model, status_code)
+        else:
+            # Unreachable given FaultConfig's validation, but never silently
+            # ignore an unrecognized configuration either.
+            raise ValueError(f"Unknown fault error_type '{error_type}' configured for '{model}'")
+
+        logger.error(f"FAULT INJECTED on '{model}': {type(exc).__name__}: {exc}")
+        raise exc
+
     def _calculate_cost(self, model: str, total_tokens: int) -> float:
         """Calculates the simulated cost for a request based on proxy pricing."""
         # Default to $0.50 if model is unknown
@@ -114,6 +289,8 @@ class UnifiedLLMClient:
         Generates a response using the requested model.
         Returns a standardized LLMResponse containing the text, real latency, and simulated cost.
         """
+        self._maybe_raise_fault(model)
+
         if self.mock_mode:
             return self._mock_generate(model, prompt)
             

@@ -1,15 +1,66 @@
 import logging
 from typing import Dict, List, Callable, Optional
 
+import httpx
+
 logger = logging.getLogger(__name__)
+
+
+class HTTPAlertHook:
+    """
+    A callable alert_hook that POSTs each SLA violation as a JSON body
+    ({"model", "metric", "message"}) to a configurable webhook URL - a
+    PagerDuty/Slack incoming-webhook endpoint, or any HTTP endpoint that
+    accepts a JSON body.
+
+    Failures never propagate: a request timeout, a connection error
+    (refused, DNS failure, TLS error, etc.), and a non-2xx response are
+    each caught and logged with the specific cause, not collapsed into a
+    single generic message. AlertManager.check_metrics calls this once
+    per violation and must keep evaluating every model/metric even if
+    the webhook endpoint is down or misconfigured - a dead alerting
+    endpoint must never be able to crash metric checks.
+    """
+
+    def __init__(self, url: str, timeout: float = 5.0):
+        self.url = url
+        self.timeout = timeout
+
+    def __call__(self, model: str, metric: str, message: str) -> None:
+        payload = {"model": model, "metric": metric, "message": message}
+        try:
+            response = httpx.post(self.url, json=payload, timeout=self.timeout)
+            response.raise_for_status()
+        except httpx.TimeoutException as e:
+            logger.error(f"Alert webhook to {self.url} timed out after {self.timeout}s: {e}")
+        except httpx.HTTPStatusError as e:
+            logger.error(
+                f"Alert webhook to {self.url} returned HTTP {e.response.status_code}: "
+                f"{e.response.text[:200]!r}"
+            )
+        except httpx.RequestError as e:
+            # Connection refused, DNS failure, TLS error, and any other
+            # transport-level failure that isn't specifically a timeout.
+            logger.error(f"Alert webhook to {self.url} failed: {type(e).__name__}: {e}")
+        except Exception as e:
+            # Not expected to be reachable given the above, but this hook
+            # must never be the thing that crashes check_metrics.
+            logger.error(f"Unexpected error posting alert webhook to {self.url}: {type(e).__name__}: {e}")
+
 
 class AlertManager:
     """
     STAGE 8c: Alerting based on SLA Degradation.
-    
-    Monitors metrics produced by SLATracker. If latency or escalation rates 
-    exceed thresholds, it triggers alerts. In production, this would fire 
-    webhooks to PagerDuty or Slack.
+
+    Monitors metrics produced by SLATracker. If latency or escalation
+    rates exceed thresholds, it triggers alerts. `alert_hook` is any
+    callable of (model, metric, message) -> None invoked once per
+    violation; pass HTTPAlertHook(url) to fire a real webhook to
+    PagerDuty, Slack, or any other HTTP endpoint, or supply your own
+    callable for a different integration. Whatever the hook does,
+    check_metrics guarantees it can't crash a metrics check: any
+    exception the hook raises is caught and logged here too, on top of
+    whatever HTTPAlertHook already isolates internally.
     """
     
     def __init__(self, 
